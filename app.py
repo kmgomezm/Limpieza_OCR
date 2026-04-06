@@ -1,6 +1,4 @@
 import streamlit as st
-import anthropic
-import base64
 import json
 import tempfile
 import os
@@ -10,6 +8,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 import fitz  # PyMuPDF
+from groq import Groq
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -20,41 +19,37 @@ st.set_page_config(
 
 st.title("📖 Poetry OCR Extractor")
 st.markdown(
-    "Sube un PDF con poemas. Claude analiza cada página, detecta títulos, "
-    "hablantes y versos, y genera un documento Word limpio."
+    "Sube un PDF con poemas. Extrae el texto y usa **Groq (gratis)** para "
+    "limpiar y estructurar el contenido, luego descarga un Word limpio."
 )
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── PDF helpers ───────────────────────────────────────────────────────────────
 
-def pdf_page_to_base64(pdf_path: str, page_index: int) -> str:
-    """Render a single PDF page to PNG at 2x zoom and return base64."""
+def extract_text_from_page(pdf_path: str, page_index: int) -> str:
+    """Extract raw selectable text from a PDF page."""
     doc = fitz.open(pdf_path)
     page = doc[page_index]
-    mat = fitz.Matrix(2.0, 2.0)   # ~144 dpi
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    png_bytes = pix.tobytes("png")
+    # Use dict mode to preserve layout order
+    text = page.get_text("text", sort=True)
     doc.close()
-    return base64.standard_b64encode(png_bytes).decode()
+    return text.strip()
 
 
-def is_blank_page(pdf_path: str, page_index: int, threshold: float = 0.98) -> bool:
-    """Return True if the page is visually blank (almost all white pixels)."""
-    doc = fitz.open(pdf_path)
-    page = doc[page_index]
-    mat = fitz.Matrix(0.5, 0.5)   # low-res for speed
-    pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csGRAY)
-    samples = pix.samples
-    doc.close()
-    white = sum(1 for b in samples if b > 240)
-    return (white / len(samples)) >= threshold
+def is_blank_page(pdf_path: str, page_index: int) -> bool:
+    """Return True if the page has no meaningful text content."""
+    text = extract_text_from_page(pdf_path, page_index)
+    # Consider blank if fewer than 20 non-whitespace characters
+    return len(text.replace("\n", "").replace(" ", "")) < 20
 
 
-# ── Claude prompt ─────────────────────────────────────────────────────────────
+# ── Groq prompt ───────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Eres un experto en OCR y transcripción de poesía hispanohablante.
-Recibirás la imagen de una página de un libro de poemas.
+SYSTEM_PROMPT = """Eres un experto en edición y transcripción de poesía hispanohablante.
+Recibirás el texto CRUDO extraído automáticamente de una página de un libro de poemas.
+El texto está sucio: tiene números de línea a la izquierda, anotaciones editoriales
+a la derecha como (GB¹, OC¹, LV², P³...), encabezados de página repetidos, y números de página.
 
-Tu tarea es extraer TODO el contenido estructurado visible en la página.
+Tu tarea es limpiar y estructurar ese texto.
 
 Devuelve ÚNICAMENTE un objeto JSON válido con esta forma exacta
 (sin bloques de código, sin texto antes o después):
@@ -77,50 +72,43 @@ Devuelve ÚNICAMENTE un objeto JSON válido con esta forma exacta
 }
 
 Reglas CRÍTICAS:
-1. Si la página está completamente en blanco, devuelve {"blank": true, "page_header": null, "poems": [], "footnotes": []}.
-2. Una sola página puede contener DOS o más poemas completos — inclúyelos todos en el array "poems".
+1. Si la página no tiene poemas ni contenido relevante, devuelve {"blank": true, "page_header": null, "poems": [], "footnotes": []}.
+2. Una sola página puede contener DOS o más poemas completos — inclúyelos TODOS en el array "poems".
 3. Un poema puede tener múltiples secciones con distintos hablantes.
-   Ejemplo: El poema "El mal del siglo" tiene sección "El paciente:" y sección "El médico:".
+   Ejemplo: "El mal del siglo" tiene sección "El paciente:" y sección "El médico:".
 4. Si no hay hablante en una sección, pon null en "speaker".
-5. Transcribe los versos exactamente: conserva tildes, puntos suspensivos, signos de exclamación/interrogación, mayúsculas.
-6. Las notas al pie (generalmente en letra pequeña al fondo) van en "footnotes" (puede ser []).
-7. Ignora los números de página y los números de línea que aparezcan a la izquierda de los versos.
-8. No incluyas las variantes textuales que aparecen a la derecha de los versos (son anotaciones editoriales).
+5. ELIMINA completamente:
+   - Números de línea (ej: "5", "10", "15" solos al inicio de línea)
+   - Anotaciones editoriales entre paréntesis: (GB¹), (OC¹), (LV²), (P³), [sin comas en OC¹], etc.
+   - Números de página solos
+   - Encabezados repetidos de página (ej: "GOTAS AMARGAS", "JOSÉ ASUNCIÓN SILVA")
+6. Conserva tildes, puntos suspensivos, signos de exclamación/interrogación, mayúsculas originales.
+7. Las notas al pie (letra pequeña al fondo, generalmente empiezan con superíndice) van en "footnotes".
+8. Los títulos de poema suelen estar centrados y en mayúsculas.
+9. Los nombres de hablantes suelen terminar en dos puntos (ej: "El paciente:").
 """
 
 
-def extract_page(client: anthropic.Anthropic, b64_image: str, page_num: int) -> dict:
-    """Call Claude vision to extract structured content from one page image."""
-    message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=2048,
-        system=SYSTEM_PROMPT,
+def structure_page(client: Groq, raw_text: str, page_num: int) -> dict:
+    """Send raw text to Groq and get back structured JSON."""
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": b64_image,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            f"Extrae el contenido estructurado de esta página (página {page_num}). "
-                            "Recuerda: puede haber 0, 1 o 2 poemas en la misma página. "
-                            "Devuelve solo el JSON."
-                        ),
-                    },
-                ],
-            }
+                "content": (
+                    f"Aquí está el texto crudo de la página {page_num}:\n\n"
+                    f"```\n{raw_text}\n```\n\n"
+                    "Limpia y estructura este texto. Devuelve solo el JSON."
+                ),
+            },
         ],
+        temperature=0.1,
+        max_tokens=2048,
     )
-    raw = message.content[0].text.strip()
-    # Strip markdown fences if model wraps the JSON
+    raw = response.choices[0].message.content.strip()
+    # Strip markdown fences if present
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = parts[1] if len(parts) > 1 else raw
@@ -142,7 +130,6 @@ def add_page_break(doc: Document) -> None:
 def build_docx(all_pages: list) -> bytes:
     doc = Document()
 
-    # Default font
     style = doc.styles["Normal"]
     style.font.name = "Garamond"
     style.font.size = Pt(11)
@@ -151,7 +138,6 @@ def build_docx(all_pages: list) -> bytes:
     first_content = True
 
     for page_data in all_pages:
-        # Blank page → page break in Word
         if page_data.get("blank"):
             if not first_content:
                 add_page_break(doc)
@@ -171,7 +157,6 @@ def build_docx(all_pages: list) -> bytes:
             title = poem.get("title") or ""
             title_key = title.strip().upper()
 
-            # Title — only once per poem even if it spans multiple pages
             if title_key and title_key not in seen_titles:
                 seen_titles.add(title_key)
                 p = doc.add_paragraph()
@@ -182,7 +167,6 @@ def build_docx(all_pages: list) -> bytes:
                 p.paragraph_format.space_before = Pt(20)
                 p.paragraph_format.space_after = Pt(8)
 
-            # Sections
             for section in poem.get("sections", []):
                 speaker = section.get("speaker")
                 if speaker:
@@ -200,11 +184,9 @@ def build_docx(all_pages: list) -> bytes:
                     lp.paragraph_format.space_after = Pt(1)
                     lp.paragraph_format.left_indent = Inches(0.5)
 
-            # Gap between poems on the same page
             gap = doc.add_paragraph()
             gap.paragraph_format.space_after = Pt(10)
 
-        # Footnotes
         for fn in footnotes:
             fp = doc.add_paragraph()
             fr = fp.add_run(fn.strip())
@@ -241,16 +223,25 @@ def parse_page_range(spec: str, total: int) -> list:
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-st.info(
-    "💡 **API Key:** Cópiala desde [console.anthropic.com](https://console.anthropic.com) "
-    "→ *API Keys*. Asegúrate de que no tenga espacios al inicio o al final.",
-)
+with st.expander("ℹ️ ¿Cómo obtener la API Key de Groq? (es gratis)"):
+    st.markdown(
+        """
+1. Ve a [console.groq.com](https://console.groq.com) y crea una cuenta gratuita
+2. En el menú izquierdo: **API Keys** → **Create API Key**
+3. Copia la clave y pégala abajo
+
+**Límites gratuitos de Groq:**
+- 14,400 requests / día
+- 30 requests / minuto
+- Más que suficiente para 40 páginas
+        """
+    )
 
 api_key = st.text_input(
-    "🔑 Anthropic API Key",
+    "🔑 Groq API Key",
     type="password",
-    placeholder="sk-ant-api03-...",
-    help="No se almacena en ningún servidor.",
+    placeholder="gsk_...",
+    help="Gratis en console.groq.com. No se almacena.",
 )
 
 uploaded_file = st.file_uploader("📄 Sube tu PDF", type=["pdf"])
@@ -263,23 +254,17 @@ with col1:
         placeholder="todas  ó  1-10  ó  1,3,5-8",
     )
 with col2:
-    detect_blanks = st.checkbox(
-        "Detectar páginas en blanco automáticamente",
-        value=True,
-        help="Evita llamadas innecesarias a Claude para páginas vacías.",
-    )
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    show_raw = st.checkbox("Mostrar texto crudo extraído", value=False)
 
 if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type="primary"):
 
     api_key = api_key.strip()
-    if not api_key.startswith("sk-ant-"):
-        st.error(
-            "⛔ La API key no parece válida — debe comenzar con `sk-ant-`. "
-            "Cópiala desde [console.anthropic.com](https://console.anthropic.com)."
-        )
+    if not api_key.startswith("gsk_"):
+        st.error("⛔ La API key de Groq debe comenzar con `gsk_`. Obtén la tuya en [console.groq.com](https://console.groq.com).")
         st.stop()
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = Groq(api_key=api_key)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
         tmp_pdf.write(uploaded_file.read())
@@ -297,13 +282,17 @@ if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type
     all_pages = []
     errors = []
     blank_count = 0
+    raw_texts = {}
 
     for i, page_idx in enumerate(pages_to_process):
         page_num = page_idx + 1
-        status.text(f"Analizando página {page_num} / {len(pages_to_process)}…")
+        status.text(f"Página {page_num} / {len(pages_to_process)}…")
 
         try:
-            if detect_blanks and is_blank_page(pdf_path, page_idx):
+            raw_text = extract_text_from_page(pdf_path, page_idx)
+            raw_texts[page_num] = raw_text
+
+            if is_blank_page(pdf_path, page_idx):
                 all_pages.append({
                     "_page": page_num,
                     "blank": True,
@@ -313,8 +302,7 @@ if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type
                 })
                 blank_count += 1
             else:
-                b64 = pdf_page_to_base64(pdf_path, page_idx)
-                result = extract_page(client, b64, page_num)
+                result = structure_page(client, raw_text, page_num)
                 result["_page"] = page_num
                 all_pages.append(result)
 
@@ -330,7 +318,7 @@ if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type
     status.empty()
 
     if errors:
-        with st.expander(f"⚠️ {len(errors)} errores — click para ver"):
+        with st.expander(f"⚠️ {len(errors)} errores"):
             for err in errors:
                 st.code(err)
 
@@ -340,7 +328,13 @@ if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type
             f"✅ {ok} páginas procesadas · {blank_count} en blanco preservadas."
         )
 
-        with st.expander("🔍 Ver datos extraídos (JSON)"):
+        if show_raw:
+            with st.expander("📄 Texto crudo extraído por página"):
+                for page_num, text in raw_texts.items():
+                    st.markdown(f"**Página {page_num}**")
+                    st.code(text)
+
+        with st.expander("🔍 Ver datos estructurados (JSON)"):
             st.json(all_pages)
 
         with st.spinner("Generando documento Word…"):
