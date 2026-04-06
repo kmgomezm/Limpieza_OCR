@@ -4,13 +4,14 @@ import base64
 import json
 import tempfile
 import os
-from pathlib import Path
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 import fitz  # PyMuPDF
 
-# ── Page config ──────────────────────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Poetry OCR Extractor",
     page_icon="📖",
@@ -26,53 +27,73 @@ st.markdown(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def pdf_page_to_base64(pdf_path: str, page_index: int) -> str:
-    """Render a single PDF page to a PNG and return base64."""
+    """Render a single PDF page to PNG at 2x zoom and return base64."""
     doc = fitz.open(pdf_path)
     page = doc[page_index]
-    mat = fitz.Matrix(2.0, 2.0)          # 2× zoom → ~144 dpi
+    mat = fitz.Matrix(2.0, 2.0)   # ~144 dpi
     pix = page.get_pixmap(matrix=mat, alpha=False)
     png_bytes = pix.tobytes("png")
     doc.close()
     return base64.standard_b64encode(png_bytes).decode()
 
 
-SYSTEM_PROMPT = """Eres un experto en OCR y transcripción de poesía.
-Recibirás la imagen de una página de un libro de poemas.
-Tu tarea es extraer el contenido estructurado de esa página.
+def is_blank_page(pdf_path: str, page_index: int, threshold: float = 0.98) -> bool:
+    """Return True if the page is visually blank (almost all white pixels)."""
+    doc = fitz.open(pdf_path)
+    page = doc[page_index]
+    mat = fitz.Matrix(0.5, 0.5)   # low-res for speed
+    pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csGRAY)
+    samples = pix.samples
+    doc.close()
+    white = sum(1 for b in samples if b > 240)
+    return (white / len(samples)) >= threshold
 
-Devuelve ÚNICAMENTE un JSON válido con esta forma (sin markdown, sin texto extra):
+
+# ── Claude prompt ─────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """Eres un experto en OCR y transcripción de poesía hispanohablante.
+Recibirás la imagen de una página de un libro de poemas.
+
+Tu tarea es extraer TODO el contenido estructurado visible en la página.
+
+Devuelve ÚNICAMENTE un objeto JSON válido con esta forma exacta
+(sin bloques de código, sin texto antes o después):
 
 {
-  "page_header": "texto del encabezado si existe, o null",
+  "blank": false,
+  "page_header": "texto del encabezado de página si existe, o null",
   "poems": [
     {
-      "title": "TÍTULO DEL POEMA o null si no hay",
+      "title": "TÍTULO DEL POEMA en mayúsculas tal como aparece, o null",
       "sections": [
         {
-          "speaker": "Nombre del hablante o null si no hay",
-          "lines": ["verso 1", "verso 2", ...]
+          "speaker": "Nombre del hablante si aparece (ej: 'El paciente:', 'El médico:'), o null",
+          "lines": ["verso 1", "verso 2", "..."]
         }
       ]
     }
   ],
-  "footnotes": ["nota 1", "nota 2"]
+  "footnotes": ["nota al pie 1", "nota al pie 2"]
 }
 
-Reglas:
-- Puede haber 0, 1 o más poemas por página.
-- Un poema puede tener múltiples secciones con distintos hablantes (ej. "El paciente:", "El médico:").
-- Si no hay hablante, pon null en "speaker".
-- Conserva la puntuación y acentos originales.
-- Las notas al pie van en "footnotes" (pueden ser []).
-- Si la página no tiene poemas (ej. es una página en blanco o solo encabezado), devuelve "poems": [].
+Reglas CRÍTICAS:
+1. Si la página está completamente en blanco, devuelve {"blank": true, "page_header": null, "poems": [], "footnotes": []}.
+2. Una sola página puede contener DOS o más poemas completos — inclúyelos todos en el array "poems".
+3. Un poema puede tener múltiples secciones con distintos hablantes.
+   Ejemplo: El poema "El mal del siglo" tiene sección "El paciente:" y sección "El médico:".
+4. Si no hay hablante en una sección, pon null en "speaker".
+5. Transcribe los versos exactamente: conserva tildes, puntos suspensivos, signos de exclamación/interrogación, mayúsculas.
+6. Las notas al pie (generalmente en letra pequeña al fondo) van en "footnotes" (puede ser []).
+7. Ignora los números de página y los números de línea que aparezcan a la izquierda de los versos.
+8. No incluyas las variantes textuales que aparecen a la derecha de los versos (son anotaciones editoriales).
 """
 
 
 def extract_page(client: anthropic.Anthropic, b64_image: str, page_num: int) -> dict:
-    """Call Claude to extract structured content from one page image."""
+    """Call Claude vision to extract structured content from one page image."""
     message = client.messages.create(
         model="claude-opus-4-5",
-        max_tokens=2000,
+        max_tokens=2048,
         system=SYSTEM_PROMPT,
         messages=[
             {
@@ -88,57 +109,88 @@ def extract_page(client: anthropic.Anthropic, b64_image: str, page_num: int) -> 
                     },
                     {
                         "type": "text",
-                        "text": f"Extrae el contenido estructurado de esta página (página {page_num}).",
+                        "text": (
+                            f"Extrae el contenido estructurado de esta página (página {page_num}). "
+                            "Recuerda: puede haber 0, 1 o 2 poemas en la misma página. "
+                            "Devuelve solo el JSON."
+                        ),
                     },
                 ],
             }
         ],
     )
     raw = message.content[0].text.strip()
-    # Strip markdown fences if present
+    # Strip markdown fences if model wraps the JSON
     if raw.startswith("```"):
-        raw = raw.split("```")[1]
+        parts = raw.split("```")
+        raw = parts[1] if len(parts) > 1 else raw
         if raw.startswith("json"):
             raw = raw[4:]
-    return json.loads(raw)
+    return json.loads(raw.strip())
 
 
 # ── Word document builder ─────────────────────────────────────────────────────
 
-def build_docx(all_pages: list[dict]) -> bytes:
+def add_page_break(doc: Document) -> None:
+    p = doc.add_paragraph()
+    run = p.add_run()
+    br = OxmlElement("w:br")
+    br.set(qn("w:type"), "page")
+    run._r.append(br)
+
+
+def build_docx(all_pages: list) -> bytes:
     doc = Document()
 
-    # Default style
+    # Default font
     style = doc.styles["Normal"]
     style.font.name = "Garamond"
     style.font.size = Pt(11)
 
-    seen_titles = set()
+    seen_titles: set = set()
+    first_content = True
 
     for page_data in all_pages:
-        poems = page_data.get("poems", [])
-        for poem in poems:
-            title = poem.get("title")
+        # Blank page → page break in Word
+        if page_data.get("blank"):
+            if not first_content:
+                add_page_break(doc)
+            else:
+                doc.add_paragraph()
+            continue
 
-            # Poem title
-            if title and title not in seen_titles:
-                seen_titles.add(title)
+        poems = page_data.get("poems", [])
+        footnotes = page_data.get("footnotes", [])
+
+        if not poems and not footnotes:
+            continue
+
+        first_content = False
+
+        for poem in poems:
+            title = poem.get("title") or ""
+            title_key = title.strip().upper()
+
+            # Title — only once per poem even if it spans multiple pages
+            if title_key and title_key not in seen_titles:
+                seen_titles.add(title_key)
                 p = doc.add_paragraph()
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                run = p.add_run(title)
+                run = p.add_run(title.strip())
                 run.bold = True
                 run.font.size = Pt(13)
-                p.paragraph_format.space_before = Pt(18)
-                p.paragraph_format.space_after = Pt(6)
+                p.paragraph_format.space_before = Pt(20)
+                p.paragraph_format.space_after = Pt(8)
 
+            # Sections
             for section in poem.get("sections", []):
                 speaker = section.get("speaker")
                 if speaker:
                     sp = doc.add_paragraph()
-                    sr = sp.add_run(speaker)
+                    sr = sp.add_run(speaker.strip())
                     sr.italic = True
                     sr.font.size = Pt(11)
-                    sp.paragraph_format.space_before = Pt(6)
+                    sp.paragraph_format.space_before = Pt(8)
                     sp.paragraph_format.space_after = Pt(2)
 
                 for line in section.get("lines", []):
@@ -146,20 +198,20 @@ def build_docx(all_pages: list[dict]) -> bytes:
                     lp.add_run(line)
                     lp.paragraph_format.space_before = Pt(0)
                     lp.paragraph_format.space_after = Pt(1)
-                    lp.paragraph_format.left_indent = Inches(0.4)
+                    lp.paragraph_format.left_indent = Inches(0.5)
 
-            # Small gap after each poem section block
-            doc.add_paragraph().paragraph_format.space_after = Pt(6)
+            # Gap between poems on the same page
+            gap = doc.add_paragraph()
+            gap.paragraph_format.space_after = Pt(10)
 
         # Footnotes
-        footnotes = page_data.get("footnotes", [])
         for fn in footnotes:
             fp = doc.add_paragraph()
-            fr = fp.add_run(fn)
-            fr.font.size = Pt(9)
+            fr = fp.add_run(fn.strip())
+            fr.font.size = Pt(8.5)
             fr.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
             fp.paragraph_format.space_before = Pt(0)
-            fp.paragraph_format.space_after = Pt(2)
+            fp.paragraph_format.space_after = Pt(1)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
         doc.save(tmp.name)
@@ -171,26 +223,9 @@ def build_docx(all_pages: list[dict]) -> bytes:
     return data
 
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+# ── Page range parser ─────────────────────────────────────────────────────────
 
-api_key = st.text_input(
-    "🔑 Anthropic API Key",
-    type="password",
-    help="Tu clave de API de Anthropic. No se almacena.",
-)
-
-uploaded_file = st.file_uploader("📄 Sube tu PDF", type=["pdf"])
-
-col1, col2 = st.columns([1, 2])
-with col1:
-    page_range = st.text_input(
-        "Páginas a procesar (ej: 1-5, 10, 12-15)",
-        value="todas",
-        help='Deja "todas" para procesar todo el documento.',
-    )
-
-def parse_page_range(spec: str, total: int) -> list[int]:
-    """Parse a page range string into a list of 0-based page indices."""
+def parse_page_range(spec: str, total: int) -> list:
     if spec.strip().lower() in ("todas", "all", ""):
         return list(range(total))
     indices = set()
@@ -204,7 +239,46 @@ def parse_page_range(spec: str, total: int) -> list[int]:
     return sorted(i for i in indices if 0 <= i < total)
 
 
-if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file)):
+# ── UI ────────────────────────────────────────────────────────────────────────
+
+st.info(
+    "💡 **API Key:** Cópiala desde [console.anthropic.com](https://console.anthropic.com) "
+    "→ *API Keys*. Asegúrate de que no tenga espacios al inicio o al final.",
+)
+
+api_key = st.text_input(
+    "🔑 Anthropic API Key",
+    type="password",
+    placeholder="sk-ant-api03-...",
+    help="No se almacena en ningún servidor.",
+)
+
+uploaded_file = st.file_uploader("📄 Sube tu PDF", type=["pdf"])
+
+col1, col2 = st.columns([1, 2])
+with col1:
+    page_range = st.text_input(
+        "Páginas a procesar",
+        value="todas",
+        placeholder="todas  ó  1-10  ó  1,3,5-8",
+    )
+with col2:
+    detect_blanks = st.checkbox(
+        "Detectar páginas en blanco automáticamente",
+        value=True,
+        help="Evita llamadas innecesarias a Claude para páginas vacías.",
+    )
+
+if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type="primary"):
+
+    api_key = api_key.strip()
+    if not api_key.startswith("sk-ant-"):
+        st.error(
+            "⛔ La API key no parece válida — debe comenzar con `sk-ant-`. "
+            "Cópiala desde [console.anthropic.com](https://console.anthropic.com)."
+        )
+        st.stop()
+
     client = anthropic.Anthropic(api_key=api_key)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
@@ -216,23 +290,39 @@ if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file)):
     pdf_doc.close()
 
     pages_to_process = parse_page_range(page_range, total_pages)
-
     st.info(f"Procesando {len(pages_to_process)} de {total_pages} páginas…")
 
     progress = st.progress(0)
     status = st.empty()
-    all_pages: list[dict] = []
+    all_pages = []
     errors = []
+    blank_count = 0
 
     for i, page_idx in enumerate(pages_to_process):
-        status.text(f"Analizando página {page_idx + 1}…")
+        page_num = page_idx + 1
+        status.text(f"Analizando página {page_num} / {len(pages_to_process)}…")
+
         try:
-            b64 = pdf_page_to_base64(pdf_path, page_idx)
-            result = extract_page(client, b64, page_idx + 1)
-            result["_page"] = page_idx + 1
-            all_pages.append(result)
+            if detect_blanks and is_blank_page(pdf_path, page_idx):
+                all_pages.append({
+                    "_page": page_num,
+                    "blank": True,
+                    "page_header": None,
+                    "poems": [],
+                    "footnotes": [],
+                })
+                blank_count += 1
+            else:
+                b64 = pdf_page_to_base64(pdf_path, page_idx)
+                result = extract_page(client, b64, page_num)
+                result["_page"] = page_num
+                all_pages.append(result)
+
+        except json.JSONDecodeError as e:
+            errors.append(f"Página {page_num}: JSON inválido — {e}")
         except Exception as e:
-            errors.append(f"Página {page_idx + 1}: {e}")
+            errors.append(f"Página {page_num}: {e}")
+
         progress.progress((i + 1) / len(pages_to_process))
 
     os.unlink(pdf_path)
@@ -240,16 +330,19 @@ if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file)):
     status.empty()
 
     if errors:
-        st.warning("Algunos errores:\n" + "\n".join(errors))
+        with st.expander(f"⚠️ {len(errors)} errores — click para ver"):
+            for err in errors:
+                st.code(err)
 
     if all_pages:
-        st.success(f"✅ {len(all_pages)} páginas procesadas correctamente.")
+        ok = len(all_pages) - len(errors)
+        st.success(
+            f"✅ {ok} páginas procesadas · {blank_count} en blanco preservadas."
+        )
 
-        # Preview in expander
         with st.expander("🔍 Ver datos extraídos (JSON)"):
             st.json(all_pages)
 
-        # Build Word doc
         with st.spinner("Generando documento Word…"):
             docx_bytes = build_docx(all_pages)
 
