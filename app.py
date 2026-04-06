@@ -114,7 +114,12 @@ Devuelve solo JSON.
             raise Exception(response.text)
 
         result = response.json()
-        generated_text = result[0]["generated_text"]
+        if isinstance(result, list):
+            generated_text = result[0].get("generated_text", "")
+        elif isinstance(result, dict):
+            generated_text = result.get("generated_text", "")
+        else:
+            raise Exception(f"Respuesta inesperada: {result}")
 
         # limpiar markdown
         if "```" in generated_text:
