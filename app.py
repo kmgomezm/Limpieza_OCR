@@ -14,7 +14,7 @@ import fitz  # PyMuPDF
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 
-HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+HF_API_URL = "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.2"
 
 st.set_page_config(
     page_title="Poetry OCR Extractor",
