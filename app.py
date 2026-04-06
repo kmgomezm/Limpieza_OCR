@@ -2,40 +2,46 @@ import streamlit as st
 import json
 import tempfile
 import os
+import requests
+import time
+
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 import fitz  # PyMuPDF
-from groq import Groq
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── CONFIG ───────────────────────────────────────────────────────────────────
+
+HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+
 st.set_page_config(
     page_title="Poetry OCR Extractor",
     page_icon="📖",
     layout="wide",
 )
 
-st.title("📖 Poetry OCR Extractor")
+st.title("📖 Poetry OCR Extractor (Hugging Face)")
 st.markdown(
-    "Sube un PDF con poemas. Extrae el texto y usa **Groq (gratis)** para "
-    "limpiar y estructurar el contenido, luego descarga un Word limpio."
+    "Sube un PDF con poemas. Extrae el texto y usa **Hugging Face (gratis)** "
+    "para limpiar y estructurar el contenido."
 )
 
-# ── PDF helpers ───────────────────────────────────────────────────────────────
+# ── PDF HELPERS ──────────────────────────────────────────────────────────────
 
 def extract_text_half(pdf_path: str, page_index: int, half: str) -> str:
-    """Extract text from left half, right half, or full page."""
     doc = fitz.open(pdf_path)
     page = doc[page_index]
     rect = page.rect
+
     if half == "left":
         clip = fitz.Rect(rect.x0, rect.y0, rect.x1 / 2, rect.y1)
     elif half == "right":
         clip = fitz.Rect(rect.x1 / 2, rect.y0, rect.x1, rect.y1)
     else:
         clip = rect
+
     text = page.get_text("text", clip=clip, sort=True)
     doc.close()
     return text.strip()
@@ -53,82 +59,78 @@ def detect_page_mode(pdf_path: str, page_index: int) -> str:
     return "double" if ratio > 1.2 else "single"
 
 
-# ── Groq prompt ───────────────────────────────────────────────────────────────
+# ── PROMPT ───────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """Eres un experto en edición y transcripción de poesía hispanohablante.
-Recibirás el texto CRUDO extraído automáticamente de una página de un libro de poemas.
-El texto está sucio: tiene números de línea a la izquierda, anotaciones editoriales
-a la derecha como (GB¹, OC¹, LV², P³...), encabezados de página repetidos, y números de página.
-
-Tu tarea es limpiar y estructurar ese texto.
-
-Devuelve ÚNICAMENTE un objeto JSON válido con esta forma exacta
-(sin bloques de código, sin texto antes o después):
+Devuelve ÚNICAMENTE JSON válido con esta estructura:
 
 {
   "blank": false,
-  "page_header": "texto del encabezado de página si existe, o null",
-  "poems": [
-    {
-      "title": "TÍTULO DEL POEMA en mayúsculas tal como aparece, o null",
-      "sections": [
-        {
-          "speaker": "Nombre del hablante si aparece (ej: 'El paciente:', 'El médico:'), o null",
-          "lines": ["verso 1", "verso 2", "..."]
-        }
-      ]
-    }
-  ],
-  "footnotes": ["nota al pie 1", "nota al pie 2"]
+  "page_header": null,
+  "poems": [],
+  "footnotes": []
 }
 
-Reglas CRÍTICAS:
-1. Si la página no tiene poemas ni contenido relevante, devuelve {"blank": true, "page_header": null, "poems": [], "footnotes": []}.
-2. Una sola página puede contener DOS o más poemas completos — inclúyelos TODOS en el array "poems".
-3. Un poema puede tener múltiples secciones con distintos hablantes.
-   Ejemplo: "El mal del siglo" tiene sección "El paciente:" y sección "El médico:".
-4. Si no hay hablante en una sección, pon null en "speaker".
-5. ELIMINA completamente:
-   - Números de línea (ej: "5", "10", "15" solos al inicio de línea)
-   - Anotaciones editoriales entre paréntesis: (GB¹), (OC¹), (LV²), (P³), [sin comas en OC¹], etc.
-   - Números de página solos
-   - Encabezados repetidos de página (ej: "GOTAS AMARGAS", "JOSÉ ASUNCIÓN SILVA")
-6. Conserva tildes, puntos suspensivos, signos de exclamación/interrogación, mayúsculas originales.
-7. Las notas al pie (letra pequeña al fondo, generalmente empiezan con superíndice) van en "footnotes".
-8. Los títulos de poema suelen estar centrados y en mayúsculas.
-9. Los nombres de hablantes suelen terminar en dos puntos (ej: "El paciente:").
+Reglas:
+- Elimina números de línea, encabezados, anotaciones (GB¹, etc.)
+- Mantén versos intactos
+- Detecta títulos en mayúsculas
+- Separa hablantes si existen
+- Si no hay contenido: blank=true
 """
 
 
-def structure_page(client: Groq, model: str, raw_text: str, label: str) -> dict:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Texto crudo de {label}:\n\n"
-                    f"```\n{raw_text}\n```\n\n"
-                    "Limpia y estructura. Devuelve solo el JSON."
-                ),
-            },
-        ],
-        temperature=0.1,
-        max_tokens=2048,
-    )
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        raw = parts[1] if len(parts) > 1 else raw
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
+# ── HUGGING FACE CALL ─────────────────────────────────────────────────────────
+
+def structure_page_hf(api_key: str, raw_text: str, label: str) -> dict:
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    prompt = f"""{SYSTEM_PROMPT}
+
+Texto crudo de {label}:
+
+{raw_text[:4000]}
+
+Devuelve solo JSON.
+"""
+
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "temperature": 0.1,
+            "max_new_tokens": 1200,
+            "return_full_text": False,
+        },
+    }
+
+    for attempt in range(3):
+        response = requests.post(HF_API_URL, headers=headers, json=payload)
+
+        if response.status_code == 503:
+            time.sleep(5)
+            continue
+
+        if response.status_code != 200:
+            raise Exception(response.text)
+
+        result = response.json()
+        generated_text = result[0]["generated_text"]
+
+        # limpiar markdown
+        if "```" in generated_text:
+            parts = generated_text.split("```")
+            generated_text = parts[1] if len(parts) > 1 else generated_text
+            if generated_text.startswith("json"):
+                generated_text = generated_text[4:]
+
+        return json.loads(generated_text.strip())
+
+    raise Exception("HF API no respondió tras varios intentos")
 
 
-# ── Word document builder ─────────────────────────────────────────────────────
+# ── DOCX BUILDER ─────────────────────────────────────────────────────────────
 
-def add_page_break(doc: Document) -> None:
+def add_page_break(doc: Document):
     p = doc.add_paragraph()
     run = p.add_run()
     br = OxmlElement("w:br")
@@ -136,289 +138,95 @@ def add_page_break(doc: Document) -> None:
     run._r.append(br)
 
 
-def build_docx(all_pages: list) -> bytes:
+def build_docx(all_pages):
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Garamond"
     style.font.size = Pt(11)
 
-    seen_titles: set = set()
-    first_content = True
-
-    for page_data in all_pages:
-        if page_data.get("blank"):
-            if not first_content:
-                add_page_break(doc)
-            else:
-                doc.add_paragraph()
-            continue
-
-        poems = page_data.get("poems", [])
-        footnotes = page_data.get("footnotes", [])
-        if not poems and not footnotes:
-            continue
-
-        first_content = False
-
-        for poem in poems:
-            title = poem.get("title") or ""
-            title_key = title.strip().upper()
-            if title_key and title_key not in seen_titles:
-                seen_titles.add(title_key)
+    for page in all_pages:
+        for poem in page.get("poems", []):
+            title = poem.get("title")
+            if title:
                 p = doc.add_paragraph()
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                run = p.add_run(title.strip())
+                run = p.add_run(title)
                 run.bold = True
                 run.font.size = Pt(13)
-                p.paragraph_format.space_before = Pt(20)
-                p.paragraph_format.space_after = Pt(8)
 
             for section in poem.get("sections", []):
                 speaker = section.get("speaker")
                 if speaker:
                     sp = doc.add_paragraph()
-                    sr = sp.add_run(speaker.strip())
-                    sr.italic = True
-                    sr.font.size = Pt(11)
-                    sp.paragraph_format.space_before = Pt(8)
-                    sp.paragraph_format.space_after = Pt(2)
+                    sp.add_run(speaker).italic = True
+
                 for line in section.get("lines", []):
                     lp = doc.add_paragraph()
                     lp.add_run(line)
-                    lp.paragraph_format.space_before = Pt(0)
-                    lp.paragraph_format.space_after = Pt(1)
                     lp.paragraph_format.left_indent = Inches(0.5)
-
-            doc.add_paragraph().paragraph_format.space_after = Pt(10)
-
-        for fn in footnotes:
-            fp = doc.add_paragraph()
-            fr = fp.add_run(fn.strip())
-            fr.font.size = Pt(8.5)
-            fr.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
-            fp.paragraph_format.space_after = Pt(1)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
         doc.save(tmp.name)
-        tmp_path = tmp.name
-    with open(tmp_path, "rb") as f:
+        path = tmp.name
+
+    with open(path, "rb") as f:
         data = f.read()
-    os.unlink(tmp_path)
+
+    os.unlink(path)
     return data
 
 
-# ── Page range parser ─────────────────────────────────────────────────────────
-
-def parse_page_range(spec: str, total: int) -> list:
-    if spec.strip().lower() in ("todas", "all", ""):
-        return list(range(total))
-    indices = set()
-    for part in spec.split(","):
-        part = part.strip()
-        if "-" in part:
-            a, b = part.split("-", 1)
-            indices.update(range(int(a) - 1, int(b)))
-        elif part.isdigit():
-            indices.add(int(part) - 1)
-    return sorted(i for i in indices if 0 <= i < total)
-
-
-# ── UI ────────────────────────────────────────────────────────────────────────
-
-with st.expander("ℹ️ ¿Cómo obtener la API Key de Groq? (es gratis)"):
-    st.markdown("""
-1. Ve a [console.groq.com](https://console.groq.com) y crea una cuenta gratuita
-2. En el menú izquierdo: **API Keys** → **Create API Key**
-3. Copia la clave (empieza con `gsk_`) y pégala abajo
-
-**Si se agotan los tokens de un modelo**, simplemente cambia el modelo en el selector — cada uno tiene su propio límite diario independiente. Los límites se reinician cada 24 horas.
-    """)
+# ── UI ───────────────────────────────────────────────────────────────────────
 
 api_key = st.text_input(
-    "🔑 Groq API Key",
+    "🔑 Hugging Face API Key",
     type="password",
-    placeholder="gsk_...",
-    help="Gratis en console.groq.com. No se almacena.",
+    placeholder="hf_...",
 )
 
 uploaded_file = st.file_uploader("📄 Sube tu PDF", type=["pdf"])
 
-# ── Opciones en 4 columnas ────────────────────────────────────────────────────
-col1, col2, col3, col4 = st.columns(4)
+if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file)):
 
-with col1:
-    page_range = st.text_input(
-        "Páginas a procesar",
-        value="todas",
-        placeholder="todas  ó  1-10  ó  1,3,5-8",
-    )
-
-with col2:
-    MODEL_OPTIONS = {
-        "llama-3.3-70b-versatile": "Llama 3.3 70B  — mejor calidad",
-        "llama-3.1-8b-instant":    "Llama 3.1 8B   — más rápido",
-        "gemma2-9b-it":            "Gemma 2 9B     — Google",
-        "mixtral-8x7b-32768":      "Mixtral 8x7B   — contexto largo",
-        "llama3-8b-8192":          "Llama 3 8B     — contexto largo",
-    }
-    selected_model = st.selectbox(
-        "🤖 Modelo Groq",
-        options=list(MODEL_OPTIONS.keys()),
-        format_func=lambda k: MODEL_OPTIONS[k],
-        help=(
-            "Cada modelo tiene su propio límite diario de tokens. "
-            "Si uno se agota, cambia a otro sin reiniciar el proceso."
-        ),
-    )
-
-with col3:
-    page_mode = st.selectbox(
-        "Tipo de páginas",
-        options=["Detectar automáticamente", "Siempre doble (landscape)", "Siempre simple"],
-        help=(
-            "Doble: cada página PDF tiene dos páginas del libro lado a lado.\n"
-            "Simple: cada página PDF es una sola página del libro."
-        ),
-    )
-
-with col4:
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-    show_raw = st.checkbox("Mostrar texto crudo", value=False)
-
-# ── Aviso de tokens agotados ──────────────────────────────────────────────────
-st.caption(
-    "💡 **Tip:** Si ves errores de *rate limit* o *tokens exceeded*, "
-    "cambia el modelo en el selector de arriba y vuelve a procesar solo las páginas pendientes."
-)
-
-# ── Botón principal ───────────────────────────────────────────────────────────
-if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type="primary"):
-
-    api_key = api_key.strip()
-    if not api_key.startswith("gsk_"):
-        st.error("⛔ La API key de Groq debe comenzar con `gsk_`. Obtén la tuya en [console.groq.com](https://console.groq.com).")
+    if not api_key.startswith("hf_"):
+        st.error("API key inválida (debe empezar con hf_)")
         st.stop()
 
-    client = Groq(api_key=api_key)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.read())
+        pdf_path = tmp.name
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-        tmp_pdf.write(uploaded_file.read())
-        pdf_path = tmp_pdf.name
-
-    pdf_doc = fitz.open(pdf_path)
-    total_pages = len(pdf_doc)
-    pdf_doc.close()
-
-    pages_to_process = parse_page_range(page_range, total_pages)
-    st.info(
-        f"Usando modelo: **{MODEL_OPTIONS[selected_model]}** · "
-        f"Procesando {len(pages_to_process)} de {total_pages} páginas…"
-    )
+    pdf = fitz.open(pdf_path)
+    total_pages = len(pdf)
+    pdf.close()
 
     progress = st.progress(0)
-    status = st.empty()
     all_pages = []
-    errors = []
-    blank_count = 0
-    raw_texts = {}
-    processed = 0
 
-    # Count total sub-pages for progress bar
-    total_subpages = 0
-    for page_idx in pages_to_process:
-        if page_mode == "Siempre doble (landscape)":
-            total_subpages += 2
-        elif page_mode == "Siempre simple":
-            total_subpages += 1
-        else:
-            total_subpages += 2 if detect_page_mode(pdf_path, page_idx) == "double" else 1
+    for i in range(total_pages):
+        raw = extract_text_half(pdf_path, i, "full")
 
-    for page_idx in pages_to_process:
-        page_num = page_idx + 1
+        try:
+            if is_text_empty(raw):
+                all_pages.append({"blank": True, "poems": []})
+            else:
+                result = structure_page_hf(api_key, raw, f"página {i+1}")
+                all_pages.append(result)
 
-        if page_mode == "Siempre doble (landscape)":
-            mode = "double"
-        elif page_mode == "Siempre simple":
-            mode = "single"
-        else:
-            mode = detect_page_mode(pdf_path, page_idx)
+        except Exception as e:
+            st.error(f"Error en página {i+1}: {e}")
 
-        halves = ["left", "right"] if mode == "double" else ["full"]
-
-        for half in halves:
-            label = (
-                f"página {page_num} ({half})"
-                if mode == "double"
-                else f"página {page_num}"
-            )
-            status.text(f"Procesando {label}…")
-
-            try:
-                raw_text = extract_text_half(pdf_path, page_idx, half)
-                raw_texts[label] = raw_text
-
-                if is_text_empty(raw_text):
-                    all_pages.append({
-                        "_label": label,
-                        "blank": True,
-                        "page_header": None,
-                        "poems": [],
-                        "footnotes": [],
-                    })
-                    blank_count += 1
-                else:
-                    result = structure_page(client, selected_model, raw_text, label)
-                    result["_label"] = label
-                    all_pages.append(result)
-
-            except json.JSONDecodeError as e:
-                errors.append(f"{label}: JSON inválido — {e}")
-            except Exception as e:
-                error_msg = str(e)
-                errors.append(f"{label}: {error_msg}")
-                # Warn immediately if it looks like a rate/token limit error
-                if "rate_limit" in error_msg.lower() or "tokens" in error_msg.lower():
-                    st.warning(
-                        f"⚠️ Límite de tokens alcanzado en **{MODEL_OPTIONS[selected_model]}**. "
-                        "Cambia el modelo en el selector, ajusta el rango de páginas a las pendientes, "
-                        "y vuelve a procesar."
-                    )
-
-            processed += 1
-            progress.progress(processed / total_subpages)
+        progress.progress((i + 1) / total_pages)
 
     os.unlink(pdf_path)
-    progress.empty()
-    status.empty()
 
-    if errors:
-        with st.expander(f"⚠️ {len(errors)} errores — click para ver"):
-            for err in errors:
-                st.code(err)
+    st.success("Procesamiento completo")
 
-    if all_pages:
-        ok = len([p for p in all_pages if not p.get("blank")])
-        st.success(
-            f"✅ {ok} sub-páginas con contenido · {blank_count} en blanco preservadas."
-        )
+    with st.spinner("Generando Word..."):
+        docx = build_docx(all_pages)
 
-        if show_raw:
-            with st.expander("📄 Texto crudo por sub-página"):
-                for label, text in raw_texts.items():
-                    st.markdown(f"**{label}**")
-                    st.code(text)
-
-        with st.expander("🔍 Ver datos estructurados (JSON)"):
-            st.json(all_pages)
-
-        with st.spinner("Generando documento Word…"):
-            docx_bytes = build_docx(all_pages)
-
-        st.download_button(
-            label="⬇️ Descargar documento Word",
-            data=docx_bytes,
-            file_name="poemas_extraidos.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-    else:
-        st.error("No se pudo extraer contenido de ninguna página.")
+    st.download_button(
+        "⬇️ Descargar Word",
+        data=docx,
+        file_name="poemas.docx",
+    )
