@@ -25,21 +25,45 @@ st.markdown(
 
 # ── PDF helpers ───────────────────────────────────────────────────────────────
 
-def extract_text_from_page(pdf_path: str, page_index: int) -> str:
-    """Extract raw selectable text from a PDF page."""
+def extract_text_half(pdf_path: str, page_index: int, half: str) -> str:
+    """
+    Extract text from only the left or right half of a page.
+    half: "left" | "right" | "full"
+    """
     doc = fitz.open(pdf_path)
     page = doc[page_index]
-    # Use dict mode to preserve layout order
-    text = page.get_text("text", sort=True)
+    rect = page.rect  # full page bounding box
+
+    if half == "left":
+        clip = fitz.Rect(rect.x0, rect.y0, rect.x1 / 2, rect.y1)
+    elif half == "right":
+        clip = fitz.Rect(rect.x1 / 2, rect.y0, rect.x1, rect.y1)
+    else:
+        clip = rect
+
+    text = page.get_text("text", clip=clip, sort=True)
     doc.close()
     return text.strip()
 
 
-def is_blank_page(pdf_path: str, page_index: int) -> bool:
-    """Return True if the page has no meaningful text content."""
-    text = extract_text_from_page(pdf_path, page_index)
-    # Consider blank if fewer than 20 non-whitespace characters
+def is_text_empty(text: str) -> bool:
+    """Return True if the extracted text has no meaningful content."""
     return len(text.replace("\n", "").replace(" ", "")) < 20
+
+
+def detect_page_mode(pdf_path: str, page_index: int) -> str:
+    """
+    Detect if a page is a double spread or single.
+    Compares the aspect ratio: landscape → likely double spread.
+    Returns "double" or "single".
+    """
+    doc = fitz.open(pdf_path)
+    page = doc[page_index]
+    rect = page.rect
+    doc.close()
+    ratio = rect.width / rect.height
+    # Landscape pages are likely double spreads
+    return "double" if ratio > 1.2 else "single"
 
 
 # ── Groq prompt ───────────────────────────────────────────────────────────────
@@ -89,7 +113,7 @@ Reglas CRÍTICAS:
 """
 
 
-def structure_page(client: Groq, raw_text: str, page_num: int) -> dict:
+def structure_page(client: Groq, raw_text: str, label: str) -> dict:
     """Send raw text to Groq and get back structured JSON."""
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -98,9 +122,9 @@ def structure_page(client: Groq, raw_text: str, page_num: int) -> dict:
             {
                 "role": "user",
                 "content": (
-                    f"Aquí está el texto crudo de la página {page_num}:\n\n"
+                    f"Texto crudo de {label}:\n\n"
                     f"```\n{raw_text}\n```\n\n"
-                    "Limpia y estructura este texto. Devuelve solo el JSON."
+                    "Limpia y estructura. Devuelve solo el JSON."
                 ),
             },
         ],
@@ -108,7 +132,6 @@ def structure_page(client: Groq, raw_text: str, page_num: int) -> dict:
         max_tokens=2048,
     )
     raw = response.choices[0].message.content.strip()
-    # Strip markdown fences if present
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = parts[1] if len(parts) > 1 else raw
@@ -129,7 +152,6 @@ def add_page_break(doc: Document) -> None:
 
 def build_docx(all_pages: list) -> bytes:
     doc = Document()
-
     style = doc.styles["Normal"]
     style.font.name = "Garamond"
     style.font.size = Pt(11)
@@ -198,7 +220,6 @@ def build_docx(all_pages: list) -> bytes:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
         doc.save(tmp.name)
         tmp_path = tmp.name
-
     with open(tmp_path, "rb") as f:
         data = f.read()
     os.unlink(tmp_path)
@@ -224,18 +245,13 @@ def parse_page_range(spec: str, total: int) -> list:
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 with st.expander("ℹ️ ¿Cómo obtener la API Key de Groq? (es gratis)"):
-    st.markdown(
-        """
+    st.markdown("""
 1. Ve a [console.groq.com](https://console.groq.com) y crea una cuenta gratuita
 2. En el menú izquierdo: **API Keys** → **Create API Key**
-3. Copia la clave y pégala abajo
+3. Copia la clave (empieza con `gsk_`) y pégala abajo
 
-**Límites gratuitos de Groq:**
-- 14,400 requests / día
-- 30 requests / minuto
-- Más que suficiente para 40 páginas
-        """
-    )
+**Límites gratuitos:** 14,400 requests/día · 30 req/min — más que suficiente para 40 páginas.
+    """)
 
 api_key = st.text_input(
     "🔑 Groq API Key",
@@ -246,7 +262,7 @@ api_key = st.text_input(
 
 uploaded_file = st.file_uploader("📄 Sube tu PDF", type=["pdf"])
 
-col1, col2 = st.columns([1, 2])
+col1, col2, col3 = st.columns(3)
 with col1:
     page_range = st.text_input(
         "Páginas a procesar",
@@ -254,7 +270,16 @@ with col1:
         placeholder="todas  ó  1-10  ó  1,3,5-8",
     )
 with col2:
-    st.markdown("&nbsp;", unsafe_allow_html=True)
+    page_mode = st.selectbox(
+        "Tipo de páginas en el PDF",
+        options=["Detectar automáticamente", "Siempre doble (landscape)", "Siempre simple"],
+        help=(
+            "• Doble: cada PDF contiene dos páginas del libro lado a lado\n"
+            "• Simple: cada PDF es una sola página del libro\n"
+            "• Automático: detecta por proporción ancho/alto"
+        ),
+    )
+with col3:
     show_raw = st.checkbox("Mostrar texto crudo extraído", value=False)
 
 if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type="primary"):
@@ -275,7 +300,7 @@ if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type
     pdf_doc.close()
 
     pages_to_process = parse_page_range(page_range, total_pages)
-    st.info(f"Procesando {len(pages_to_process)} de {total_pages} páginas…")
+    st.info(f"Procesando {len(pages_to_process)} páginas PDF ({total_pages} total)…")
 
     progress = st.progress(0)
     status = st.empty()
@@ -284,34 +309,65 @@ if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type
     blank_count = 0
     raw_texts = {}
 
-    for i, page_idx in enumerate(pages_to_process):
+    total_subpages = 0
+    processed = 0
+
+    # First pass: count total sub-pages for progress bar
+    for page_idx in pages_to_process:
+        if page_mode == "Siempre doble (landscape)":
+            total_subpages += 2
+        elif page_mode == "Siempre simple":
+            total_subpages += 1
+        else:
+            mode = detect_page_mode(pdf_path, page_idx)
+            total_subpages += 2 if mode == "double" else 1
+
+    for page_idx in pages_to_process:
         page_num = page_idx + 1
-        status.text(f"Página {page_num} / {len(pages_to_process)}…")
 
-        try:
-            raw_text = extract_text_from_page(pdf_path, page_idx)
-            raw_texts[page_num] = raw_text
+        # Decide split mode for this page
+        if page_mode == "Siempre doble (landscape)":
+            mode = "double"
+        elif page_mode == "Siempre simple":
+            mode = "single"
+        else:
+            mode = detect_page_mode(pdf_path, page_idx)
 
-            if is_blank_page(pdf_path, page_idx):
-                all_pages.append({
-                    "_page": page_num,
-                    "blank": True,
-                    "page_header": None,
-                    "poems": [],
-                    "footnotes": [],
-                })
-                blank_count += 1
-            else:
-                result = structure_page(client, raw_text, page_num)
-                result["_page"] = page_num
-                all_pages.append(result)
+        halves = ["left", "right"] if mode == "double" else ["full"]
 
-        except json.JSONDecodeError as e:
-            errors.append(f"Página {page_num}: JSON inválido — {e}")
-        except Exception as e:
-            errors.append(f"Página {page_num}: {e}")
+        for half in halves:
+            label = (
+                f"página {page_num} ({half})"
+                if mode == "double"
+                else f"página {page_num}"
+            )
+            status.text(f"Procesando {label}…")
 
-        progress.progress((i + 1) / len(pages_to_process))
+            try:
+                raw_text = extract_text_half(pdf_path, page_idx, half)
+                raw_texts[label] = raw_text
+
+                if is_text_empty(raw_text):
+                    all_pages.append({
+                        "_label": label,
+                        "blank": True,
+                        "page_header": None,
+                        "poems": [],
+                        "footnotes": [],
+                    })
+                    blank_count += 1
+                else:
+                    result = structure_page(client, raw_text, label)
+                    result["_label"] = label
+                    all_pages.append(result)
+
+            except json.JSONDecodeError as e:
+                errors.append(f"{label}: JSON inválido — {e}")
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+
+            processed += 1
+            progress.progress(processed / total_subpages)
 
     os.unlink(pdf_path)
     progress.empty()
@@ -325,13 +381,13 @@ if st.button("🚀 Procesar PDF", disabled=not (api_key and uploaded_file), type
     if all_pages:
         ok = len(all_pages) - len(errors)
         st.success(
-            f"✅ {ok} páginas procesadas · {blank_count} en blanco preservadas."
+            f"✅ {ok} sub-páginas procesadas · {blank_count} en blanco preservadas."
         )
 
         if show_raw:
-            with st.expander("📄 Texto crudo extraído por página"):
-                for page_num, text in raw_texts.items():
-                    st.markdown(f"**Página {page_num}**")
+            with st.expander("📄 Texto crudo por sub-página"):
+                for label, text in raw_texts.items():
+                    st.markdown(f"**{label}**")
                     st.code(text)
 
         with st.expander("🔍 Ver datos estructurados (JSON)"):
